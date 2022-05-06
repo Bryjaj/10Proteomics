@@ -1,0 +1,304 @@
+---
+title: "Bi1121: Proteomics (homework)"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+---
+# Introduction
+I have decided to analyze [dataset number 4](https://www.ebi.ac.uk/pride/archive/projects/PXD022038). 
+
+[DEP package](https://www.bioconductor.org/packages/release/bioc/html/DEP.html) will be used for the data analysis.
+
+The code is stored on [GitHub](https://github.com/Bryjaj/10Proteomics)
+
+
+# Libraries required
+Several libraries will be used:
+
+* here (path definitions)
+* DEP (proteomics workflow)
+* dplyr (basic data operations)
+* SummarizedExperiment (normalization purposes)
+* DT (output table generation)
+
+```{r libraries, message=FALSE, warning=FALSE}
+library(here)
+library(DEP)
+library(dplyr)
+library(DT)
+library(SummarizedExperiment)
+```
+
+# Data input
+Data will be imported using `read.delim()` function.
+
+```{r data-input, message=FALSE, warning=FALSE}
+data <- read.delim(here('data', 'proteinGroups.txt'))
+nrow(data)
+```
+
+# Data preparation
+## Contaminants filtering
+The most common contaminants will be filtered out:
+
+* Reverse sequences 
+* Only identified by site proteins
+* cRAP protein sequences (e.g common laboratory proteins, proteins added accidentally by dust/physical contact, etc.)
+* keratins
+
+```{r contaminants-filtering, message=FALSE, warning=FALSE}
+data <- data %>%
+  filter(Reverse != "+") %>%
+  filter(!grepl("cRAP", Majority.protein.IDs)) %>%
+  filter(Only.identified.by.site != "+") %>%
+  filter(!grepl("keratin", Fasta.headers)) %>%
+  filter(!grepl("Keratin", Fasta.headers)) %>%
+  filter(!grepl("PE=5", Fasta.headers))
+
+nrow(data)
+```
+
+## Unique identifiers
+For further analysis proteins must get unique names. Additionally, some proteins do not have an annotated gene name and for those we will use the Uniprot ID.
+
+```{r unique-identifiers-a, message=FALSE, warning=FALSE}
+# Duplicated gene names?
+data$Gene.names %>% duplicated() %>% any()
+
+# Make a table of duplicated gene names
+data %>% group_by(Gene.names) %>% summarize(frequency = n()) %>% 
+  arrange(desc(frequency)) %>% filter(frequency > 1)
+```
+
+```{r unique-identifiers-b, message=FALSE, warning=FALSE}
+# Make unique names using the annotation in the "Gene.names" column as primary names and the annotation in "Protein.IDs" as name for those that do not have an gene name.
+data_unique <- make_unique(data, "Gene.names", "Protein.IDs", delim = ";")
+```
+
+## SummarizedExperiment
+By creating SummarizedExperiment, the protein intensities get **log2 transformed**. There is no need for Log2 transformation on its own.
+
+```{r summarized-experiment-CK1a-1-excluded, message=FALSE, warning=FALSE}
+# grep the intensity columns
+intensity_columns <- grep("LFQ.", colnames(data_unique)) 
+
+# create experimental design
+exp_design <- data.frame(
+  label = c("LFQ.intensity.DMSO.1", "LFQ.intensity.DMSO.2", "LFQ.intensity.DMSO.3",
+            "LFQ.intensity.OXS008450.1","LFQ.intensity.OXS008450.2","LFQ.intensity.OXS008450.3",
+            "LFQ.intensity.OXS008450.OXS008255.1uM.1", "LFQ.intensity.OXS008450.OXS008255.1uM.2", "LFQ.intensity.OXS008450.OXS008255.1uM.3",
+            "LFQ.intensity.OXS008450.OXS008255.5uM.1", "LFQ.intensity.OXS008450.OXS008255.5uM.2", "LFQ.intensity.OXS008450.OXS008255.5uM.3",
+            "LFQ.intensity.OXS008450.OXS008255.25uM.1","LFQ.intensity.OXS008450.OXS008255.25uM.2","LFQ.intensity.OXS008450.OXS008255.25uM.3",                         "LFQ.intensity.OXS008450.Paclitaxel.1", "LFQ.intensity.OXS008450.Paclitaxel.2", "LFQ.intensity.OXS008450.Paclitaxel.3"),
+  condition = c("DMSO", "DMSO", "DMSO", 
+                "OXS008450", "OXS008450", "OXS008450", 
+                "OXS008450/OXS008255_1uM", "OXS008450/OXS008255_1uM", "OXS008450/OXS008255_1uM", 
+                "OXS008450/OXS008255_5uM", "OXS008450/OXS008255_5uM", "OXS008450/OXS008255_5uM",
+                "OXS008450/OXS008255_25uM", "OXS008450/OXS008255_25uM", "OXS008450/OXS008255_25uM",
+                "OXS008450/Paclitaxel_25uM", "OXS008450/Paclitaxel_25uM", "OXS008450/Paclitaxel_25uM"),
+  replicate = c(rep(1:3, times = 6))
+)
+
+# define the variable types
+exp_design$label <- as.character(exp_design$label)
+exp_design$condition <- as.character(exp_design$condition)
+exp_design$replicate <- as.numeric(exp_design$replicate)
+
+data_se <- make_se(data_unique, intensity_columns, exp_design)
+```
+
+# SumarizedExperiment intermezzo
+```{r SummarizedExperimen-plot, message=FALSE, warning=FALSE}
+data_se
+dim(data_se)
+head(assay(data_se))
+```
+
+## Number of proteins
+
+```{r plot_numbers, message=FALSE, warning=FALSE, fig.height=7}
+plot_numbers(data_se)
+```
+
+## Data filtering
+There are many missing values. The dataset will be pre-filtered to get rid of the most unreliable identifications. First of all, a barplot of the protein identification overlap between samples will be plotted.
+
+```{r filter-data-a, message=FALSE, warning=FALSE}
+plot_frequency(data_se)
+```
+
+Based on that we can choose the filtering threshold using either of two functions:
+
+* `filter_missval(se, thr = 0)`
+* `filter_proteins(se, type = c"complete", "condition", "fraction"), thr = NULL, min = NULL)`
+
+```{r filter-data-b, message=FALSE, warning=FALSE}
+data_filt <- filter_missval(data_se, thr = 1)
+plot_numbers(data_filt)
+plot_frequency(data_filt)
+```
+
+# Normalization
+
+**Vsn normalization**
+```{r normalization-vsn, message=FALSE, warning=FALSE, fig.width = 8}
+data_norm_vsn <- normalize_vsn(data_filt)
+meanSdPlot(data_norm_vsn)
+plot_normalization(data_filt, data_norm_vsn)
+```
+
+**Quantile normalization**
+```{r normalization-quantile, message=FALSE, warning=FALSE, fig.width = 8}
+data_norm_quant <- data_filt
+assay(data_norm_quant)<-limma::normalizeQuantiles(assay(data_norm_quant))
+meanSdPlot(data_norm_quant)
+plot_normalization(data_filt, data_norm_quant)
+```
+
+**LoessF normalization**
+```{r normalization-loessF, message=FALSE, warning=FALSE, fig.width = 8}
+data_norm_loess <- data_filt
+assay(data_norm_loess)<-limma::normalizeCyclicLoess(assay(data_norm_loess))
+meanSdPlot(data_norm_loess)
+plot_normalization(data_filt, data_norm_loess)
+```
+
+**Median normalization**
+```{r normalization-median, message=FALSE, warning=FALSE, fig.width = 8}
+data_norm_med <- data_filt
+assay(data_norm_med)<-limma::normalizeMedianValues(assay(data_norm_med))
+meanSdPlot(data_norm_med)
+plot_normalization(data_filt, data_norm_med)
+```
+
+In the next steps it will be continued with default vsn normalization.
+
+## Imputation of NAs
+Plotting heatmap of missing proteins in at least 1 condition (white = NA; black = present)
+```{r imputation-heatmap, message=FALSE, warning=FALSE, fig.height = 10}
+plot_missval(data_filt)
+```
+
+Plottin intensity distributions and cumulative fraction of proteins with and without missing values
+```{r imputation-distribution, message=FALSE, warning=FALSE}
+plot_detect(data_filt)
+```
+
+Impute the missing values
+```{r imputation, message=FALSE, warning=FALSE}
+data_imp <- impute(data_norm_vsn, fun = "man", shift = 1.8, scale = 0.3)
+plot_imputation(data_norm_vsn, data_imp)
+```
+
+Plotting PCA for 500 most variable proteins
+```{r imputation-pca, message=FALSE, warning=FALSE}
+plot_pca(data_imp, x = 1, y = 2, n = 500, point_size = 4)
+```
+
+# Differential expression
+
+We want to get differentially expressed proteins now, between the bait and control. For that, we will be using **limma** test.
+
+```{r limma, message=FALSE, warning=FALSE}
+# Test every sample versus control
+data_diff <- test_diff(data_imp, type = "control", control = "DMSO")
+```
+
+Now, we need to **set cutoffs** for calling a protein differentially expressed:
+- logFC -> 1
+- adjusted p-value -> 0.05
+
+So, proteins with (logFC > 1 & adj.pvalue < 0.05) will be upregulated, and proteins with  (logFC < -1 & adj.pvalue < 0.05) will be downregulated.
+
+We also need to correct for multiple testing, which in DEP is done by **fdrtools**.
+
+```{r limma-cutoff, message=FALSE, warning=FALSE}
+# Denote significant proteins based on user defined cutoffs
+dep <- add_rejections(data_diff, alpha = 0.05, lfc = log2(1))
+```
+
+# Data visualization
+
+Now let's see how our differentially expressed proteins look like:
+
+## Correlation matrix
+```{r correlation-matrix, message=FALSE, warning=FALSE, fig.height = 8}
+# Plot the Pearson correlation matrix
+plot_cor(dep, significant = TRUE, lower = 0, upper = 1, pal = "Reds")
+```
+## Heatmap of significant proteins
+```{r heatmap-proteins, message=FALSE, warning=FALSE, fig.height = 8}
+# Plot a heatmap of all significant proteins with the data centered per protein
+plot_heatmap(dep, type = "centered", kmeans = TRUE, 
+             k = 6, col_limit = 4, show_row_names = FALSE,
+             indicate = c("condition", "replicate"))
+```
+
+## Heatmap of contrasts
+```{r heatmap-contrasts, message=FALSE, warning=FALSE, fig.height = 8}
+# Plot a heatmap of all significant proteins (rows) and the tested contrasts (columns)
+plot_heatmap(dep, type = "contrast", kmeans = TRUE, 
+             k = 6, col_limit = 10, show_row_names = FALSE)
+```
+
+## Volcano plots
+
+OXS008450 vs DMSO
+```{r volcano-OXS008450, message=FALSE, warning=FALSE}
+plot_volcano(dep, contrast = "OXS008450_vs_DMSO", label_size = 2, add_names = TRUE, adjusted = TRUE)
+```
+
+OXS008450.OXS008255_1uM vs DMSO
+```{r volcano-OXS008450.OXS008255_1uM, message=FALSE, warning=FALSE}
+plot_volcano(dep, contrast = "OXS008450.OXS008255_1uM_vs_DMSO", label_size = 2, add_names = TRUE, adjusted = TRUE)
+```
+
+OXS008450.OXS008255_5uM vs DMSO
+```{r volcano-OXS008450.OXS008255_5uM, message=FALSE, warning=FALSE}
+plot_volcano(dep, contrast = "OXS008450.OXS008255_5uM_vs_DMSO", label_size = 2, add_names = TRUE, adjusted = TRUE)
+```
+
+OXS008450.Paclitaxel_25uM vs DMSO
+```{r volcano-OXS008450.Paclitaxel_25uM, message=FALSE, warning=FALSE}
+plot_volcano(dep, contrast = "OXS008450.Paclitaxel_25uM_vs_DMSO", label_size = 2, add_names = TRUE, adjusted = TRUE)
+```
+
+## Barplots of single proteins
+
+We can also plot how proteins of our interest behave across conditions:
+```{r barplots-single, message=FALSE, warning=FALSE}
+plot_single(dep, proteins = "VDAC1")
+plot_single(dep, proteins = "VDAC1", type = "centered")
+```
+
+# Results table
+
+Now, we will generate table with the results of differential expression:
+
+```{r data-results, message=FALSE, warning=FALSE}
+data_results <- get_results(dep)
+```
+
+For better work, we can also generate interactive table:
+```{r data-results-interactive, message=FALSE, warning=FALSE}
+data_results %>%
+  select(ID, name, ends_with(c('_p.val', '_p.adj', '_ratio'))) %>%
+    datatable(extensions = 'Buttons',
+            options = list(dom = 'Blfrtip',
+                           buttons = c('copy', 'csv', 'excel', 'pdf', 'print'),
+                           lengthMenu = list(c(10,25,50,-1),
+                                             c(10,25,50,"All"))))
+```
+
+We can also save the workspace for further use:
+```{r data-save, message=FALSE, warning=FALSE}
+save(data_se, data_norm_vsn, data_imp, data_diff, dep, file = here('outputs', "data.RData"))
+```
+
+# SessionInfo()
+Last, for the reproducibility, we should also save information about which packages we used using the `SessionInfo()` command:
+
+```{r session-info, message=FALSE, warning=FALSE}
+sessionInfo()
+```
